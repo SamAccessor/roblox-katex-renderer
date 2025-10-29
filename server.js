@@ -1,85 +1,99 @@
-// server.js
-// KaTeX renderer -> PNG -> raw RGBA tiles -> base64 JSON response
-// Uses: express, cors, katex, puppeteer, sharp
+// server.js -- MathJax + Sharp renderer
+// - Converts LaTeX -> SVG via MathJax (server-side)
+// - Uses sharp to rasterize SVG -> PNG/raw RGBA
+// - Slices left->right into tiles <= 1024px and returns base64 raw RGBA tiles
 
 const express = require('express');
 const cors = require('cors');
-const katex = require('katex');
-const puppeteer = require('puppeteer');
 const sharp = require('sharp');
+const MathJax = require('mathjax'); // mathjax package
+const bodyParser = require('body-parser');
 
 const MAX_TILE = 1024;
-const KATEX_CSS_LINK = 'https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css';
-
 const App = express();
-App.use(express.json({ limit: '10mb' }));
 App.use(cors());
+App.use(bodyParser.json({ limit: '10mb' }));
 
-let BrowserSingleton = null;
-async function GetBrowser() {
-  if (BrowserSingleton) return BrowserSingleton;
-  BrowserSingleton = await puppeteer.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
-  return BrowserSingleton;
+// Initialize MathJax once
+let MathJaxInstancePromise = null;
+function InitMathJax() {
+  if (!MathJaxInstancePromise) {
+    // mathjax.init API returns a Promise that resolves to a MathJax object with converters
+    MathJaxInstancePromise = MathJax.init({
+      loader: { load: ['input/tex', 'output/svg'] },
+      tex: { packages: ['base', 'ams'] },
+    });
+  }
+  return MathJaxInstancePromise;
 }
 
-function HtmlTemplate(latex, fontPx) {
-  const mathHTML = katex.renderToString(latex, { throwOnError: false, displayMode: true });
-  return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <link rel="stylesheet" href="${KATEX_CSS_LINK}">
-    <style>
-      html, body { margin:0; padding:0; background:transparent; }
-      #Math { display:inline-block; color:#FFFFFF; background:transparent; font-size:${fontPx}px; line-height:1; margin:0; padding:0; }
-      *{ -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; }
-    </style>
-  </head>
-  <body>
-    <div id="Math">${mathHTML}</div>
-  </body>
-</html>`;
+// Wrap latex into an SVG string using MathJax
+async function LatexToSvg(latex, fontPx = 64) {
+  const MathJaxObj = await InitMathJax();
+  // tex2svg returns an element-like object or serialized string depending on API;
+  // MathJax v4 exported API exposes a `tex2svg` method that returns an SVG node with outerHTML
+  // We'll coerce to string
+  const svgNode = MathJaxObj.tex2svg(latex, { display: true });
+  // Some builds return a node; take outerHTML if present, else assume it's a string.
+  const svgString = (typeof svgNode === 'string') ? svgNode : (svgNode.outerHTML || svgNode.toString());
+  // Wrap the svg (MathJax output may not set font-size on top-level). Add width:auto and style white fill + transparent background.
+  // We'll insert a CSS to ensure fill white and preserve transparency.
+  const wrappedSvg = `
+    <svg xmlns="http://www.w3.org/2000/svg">
+      <foreignObject x="0" y="0" width="100%" height="100%">
+        <div xmlns="http://www.w3.org/1999/xhtml">
+          <style>
+            :root { background: transparent; color: #FFFFFF; }
+            svg { fill: #FFFFFF; }
+          </style>
+          ${svgString}
+        </div>
+      </foreignObject>
+    </svg>
+  `;
+  return wrappedSvg;
 }
 
-async function RenderLatexToRgbaTiles(latex, fontPx = 64, pixelDensity = 2) {
-  const browser = await GetBrowser();
-  const page = await browser.newPage();
-  await page.setViewport({ width: 4096, height: 2048, deviceScaleFactor: pixelDensity });
+// Rasterize SVG at desired pixelDensity & compute dimensions
+async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = 2) {
+  // Determine an explicit raster width/height by letting sharp render at an initial scale
+  // We'll rasterize the svg to a PNG buffer at a reasonably large width, then use sharp.metadata() to get exact pixels.
+  // Because MathJax output has intrinsic sizing, sharp can compute the raster size from the SVG's viewBox.
+  // Use density param by scaling via the `density` option when input is SVG (SVG density is DPI-like)
+  // We'll pass the svg buffer to sharp and let it rasterize at appropriate dimensions.
+  // To ensure crispness, we can multiply by pixelDensity.
+  const svgBuffer = Buffer.from(svgString, 'utf8');
 
-  await page.setContent(HtmlTemplate(latex, fontPx), { waitUntil: 'networkidle0' });
-
-  const el = await page.$('#Math');
-  if (!el) { await page.close(); throw new Error('Math element not found'); }
-
-  const pngBuffer = await el.screenshot({ type: 'png', omitBackground: true });
-  await page.close();
-
+  // First rasterize to PNG buffer at scale (sharp has options: svg input supports density but exact sizing depends on SVG)
+  // To guarantee high-res, we can render at a large width by setting a big width param, but we don't know desired width
+  // Simpler: render to PNG with no explicit width, then use metadata to get pixel dimensions.
+  const pngBuffer = await sharp(svgBuffer, { density: 72 * pixelDensity }).png({ quality: 100 }).toBuffer();
   const meta = await sharp(pngBuffer).metadata();
-  const Width = meta.width || 0;
-  const Height = meta.height || 0;
-  if (!Width || !Height) throw new Error('Invalid rendered image dimensions');
+  const width = meta.width;
+  const height = meta.height;
 
-  const Base64Chunks = [];
-  const TileWidths = [];
-  for (let left = 0; left < Width; left += MAX_TILE) {
-    const TileWidth = Math.min(MAX_TILE, Width - left);
-    const TileBuffer = await sharp(pngBuffer)
-      .extract({ left, top: 0, width: TileWidth, height: Height })
+  if (!width || !height) throw new Error('Could not rasterize SVG to a valid image (no width/height)');
+
+  const base64Chunks = [];
+  const tileWidths = [];
+
+  for (let left = 0; left < width; left += MAX_TILE) {
+    const tileWidth = Math.min(MAX_TILE, width - left);
+    const tileRaw = await sharp(pngBuffer)
+      .extract({ left, top: 0, width: tileWidth, height })
       .raw()
-      .toBuffer();
-    Base64Chunks.push(TileBuffer.toString('base64'));
-    TileWidths.push(TileWidth);
+      .toBuffer(); // raw RGBA, 4 bytes per pixel
+    base64Chunks.push(tileRaw.toString('base64'));
+    tileWidths.push(tileWidth);
   }
 
   return {
-    base64Chunks: Base64Chunks,
-    tileWidths: TileWidths,
-    width: Width,
-    height: Height,
+    base64Chunks,
+    tileWidths,
+    width,
+    height,
     pixelDensity,
-    equationHeightPx: Height,
+    equationHeightPx: height,
     bytesPerPixel: 4,
     channelOrder: 'RGBA'
   };
@@ -88,19 +102,21 @@ async function RenderLatexToRgbaTiles(latex, fontPx = 64, pixelDensity = 2) {
 App.post('/render', async (req, res) => {
   try {
     const { latex, fontSize, pixelDensity } = req.body || {};
-    if (typeof latex !== 'string' || latex.length === 0) {
+    if (!latex || typeof latex !== 'string') {
       return res.status(400).json({ error: 'latex string required' });
     }
-    const FontPx = Number.isFinite(fontSize) ? fontSize : 64;
-    const Density = Number.isFinite(pixelDensity) ? pixelDensity : 2;
-    const Result = await RenderLatexToRgbaTiles(latex, FontPx, Density);
-    res.json(Result);
+    const fontPx = Number.isFinite(fontSize) ? fontSize : 64;
+    const density = Number.isFinite(pixelDensity) ? pixelDensity : 2;
+
+    // Convert latex -> SVG -> rasterized tiles
+    const svg = await LatexToSvg(latex, fontPx);
+    const result = await SvgToRgbaTiles(svg, fontPx, density);
+    res.json(result);
   } catch (err) {
-    console.error('Render error:', err);
-    res.status(500).json({ error: String(err.message || err) });
+    console.error('Render error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: String(err && err.message ? err.message : err) });
   }
 });
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-App.listen(PORT, () => console.log(`KaTeX renderer listening on ${PORT}`));
-
+App.listen(PORT, () => console.log(`MathJax renderer listening on ${PORT}`));

@@ -11,8 +11,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "katex": "^0.16.25",
-    "puppeteer": "^24.27.0",
+    "mathjax": "^4.0.0",
     "sharp": "^0.34.4"
   },
   "description": "",
