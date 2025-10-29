@@ -83,7 +83,25 @@ async function renderLatex(latex, fontSizeRequested) {
   return { success: false, error: String(lastErr && lastErr.message ? lastErr.message : lastErr) };
 }
 
-App.get("/health", (_, res) => res.json({ ok: true }));
+// --- Health Check Endpoint --- //
+app.get("/health", async (req, res) => {
+  try {
+    const uptimeSeconds = process.uptime();
+    const memory = process.memoryUsage();
+    const memoryMB = (memory.rss / 1024 / 1024).toFixed(2);
+
+    res.status(200).json({
+      status: "OK",
+      timestamp: new Date().toISOString(),
+      uptime_seconds: uptimeSeconds,
+      memory_mb: memoryMB,
+      pid: process.pid,
+    });
+  } catch (err) {
+    console.error("[/health] Error:", err);
+    res.status(500).json({ status: "ERROR", message: err.message });
+  }
+});
 
 App.post("/render", async (req, res) => {
   try {
@@ -119,3 +137,27 @@ App.post("/render", async (req, res) => {
 
 const Port = Number(process.env.PORT || 10000);
 App.listen(Port, () => console.log(`[Server] listening on port ${Port}`));
+
+// --- Keep Render awake and handle retries --- //
+const SELF_URL = "https://roblox-katex-renderer.onrender.com";
+const KEEPALIVE_INTERVAL = 25_000; // 25 seconds
+const MAX_RETRIES = 3;
+
+async function pingSelf(attempt = 1) {
+  try {
+    const res = await fetch(`${SELF_URL}/health`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    console.log(`[KeepAlive] ✅ Ping OK (Attempt ${attempt})`, data);
+  } catch (err) {
+    console.warn(`[KeepAlive] ❌ Ping failed (Attempt ${attempt}):`, err.message);
+    if (attempt < MAX_RETRIES) {
+      setTimeout(() => pingSelf(attempt + 1), 2000); // retry after 2s
+    } else {
+      console.error("[KeepAlive] 🚨 All retries failed.");
+    }
+  }
+}
+
+// run every 25s
+setInterval(pingSelf, KEEPALIVE_INTERVAL);
