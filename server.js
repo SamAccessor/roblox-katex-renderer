@@ -1,220 +1,137 @@
-const Express = require('express');
-const Cors = require('cors');
-const BodyParser = require('body-parser');
-const MathJax = require('mathjax-full');
-const Sharp = require('sharp');
+// server.js
 
-const App = Express();
-App.use(Cors());
-App.use(BodyParser.json({ limit: '10mb' }));
+const express = require('express');
+const bodyParser = require('body-parser');
+const sharp = require('sharp');
 
-const MaxTileSize = 1024;
-const RenderAttempts = 3;
-const BackoffDelay = 150;
-const DefaultCacheCapacity = 500;
+// MathJax v3 (full) SVG pipeline
+const { mathjax } = require('mathjax-full/js/mathjax.js');
+const { TeX } = require('mathjax-full/js/input/tex.js');
+const { SVG } = require('mathjax-full/js/output/svg.js');
+const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor.js');
+const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html.js');
 
-class LruCache {
-    constructor(Capacity = DefaultCacheCapacity) {
-        this.Capacity = Capacity;
-        this.Cache = new Map();
-    }
+const app = express();
 
-    Get(Key) {
-        if (!this.Cache.has(Key)) {
-            return null;
-        }
-        const Value = this.Cache.get(Key);
-        this.Cache.delete(Key);
-        this.Cache.set(Key, Value);
-        return Value;
-    }
+// Keep payload limits sane; speed/memory
+app.use(bodyParser.json({ limit: '1mb' }));
 
-    Set(Key, Value) {
-        if (this.Cache.has(Key)) {
-            this.Cache.delete(Key);
-        } else if (this.Cache.size >= this.Capacity) {
-            this.Cache.delete(this.Cache.keys().next().value);
-        }
-        this.Cache.set(Key, Value);
-    }
+// MathJax setup
+const adaptor = liteAdaptor();
+RegisterHTMLHandler(adaptor);
 
-    Stats() {
-        return {
-            size: this.Cache.size,
-            capacity: this.Capacity
-        };
-    }
-}
+const tex = new TeX({
+  packages: ['base', 'ams', 'newcommand', 'noerrors', 'noundefined'],
+  // allow plain text: you can pass normal text and MathJax will treat it; or wrap \text{} client-side if needed
+});
+const svg = new SVG({
+  fontCache: 'none', // no disk/font cache for speed & memory
+});
+const mj = mathjax.document('', { InputJax: tex, OutputJax: svg });
 
-const RenderCache = new LruCache();
-let MathJaxInstance;
+// Constants
+const MAX_TILE = 1024;
 
-MathJax.init({
-    loader: { load: ['input/tex', 'output/svg'] },
-    startup: {
-        adaptor: 'lite'
-    }
-}).then((Instance) => {
-    MathJaxInstance = Instance;
-    console.log("MathJax Initialized Successfully.");
-}).catch((Error) => console.error("MathJax Initialization Failed:", Error));
+// Utility: produces tightly-cropped PNG then raw RGBA
+async function renderLatexToRawTiles(svgString, density = 230) {
+  // librsvg handles density for SVG → raster quality
+  // Make sure SVG has white currentColor, transparent background
+  // Strip XML header (prevents “XML does not have <svg> root” issues in some pipelines)
+  svgString = svgString.replace(/<\?xml[^>]*\?>\s*/i, '');
 
-const GetRenderKey = (Latex, FontSize, PixelDensity) => {
-    return `${Latex}|${FontSize}|${PixelDensity}`;
-};
+  // Rasterize + trim to remove transparent margins
+  const trimmedPng = await sharp(Buffer.from(svgString), { density })
+    .png({ compressionLevel: 9, quality: 100 })
+    .trim() // removes fully transparent edges
+    .toBuffer();
 
-const RenderLatex = async (Latex, FontSize, PixelDensity) => {
-    const SvgNode = await MathJaxInstance.tex2svgPromise(Latex, { display: true });
-    let SvgString = MathJaxInstance.startup.adaptor.innerHTML(SvgNode);
-    SvgString = SvgString.replace(/(<svg [^>]+>)/, `$1<style>*{fill:#FFFFFF;}</style>`);
-    
-    const RenderDensity = (FontSize * PixelDensity);
-
-    const { data: RawBuffer, info } = await Sharp(Buffer.from(SvgString), {
-        density: RenderDensity,
-        limitInputPixels: false
-    })
-    .trim()
+  // Convert trimmed to raw RGBA to avoid client-side PNG decoding complexity
+  const { data: raw, info } = await sharp(trimmedPng)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-    const { width: TotalWidth, height: TotalHeight, channels: BytesPerPixel } = info;
-    const ChannelOrder = "RGBA";
+  const width = info.width;
+  const height = info.height;
 
-    let TileWidths = [];
-    for (let x = 0; x < TotalWidth; x += MaxTileSize) {
-        TileWidths.push(Math.min(MaxTileSize, TotalWidth - x));
+  // Tile if necessary
+  const tilesMeta = [];
+  for (let y = 0; y < height; y += MAX_TILE) {
+    for (let x = 0; x < width; x += MAX_TILE) {
+      const w = Math.min(MAX_TILE, width - x);
+      const h = Math.min(MAX_TILE, height - y);
+      tilesMeta.push({ x, y, w, h });
+    }
+  }
+
+  // Extract tiles from raw buffer efficiently via sharp raw extract
+  const tiles = await Promise.all(
+    tilesMeta.map(async (t) => {
+      const tileRaw = await sharp(raw, {
+        raw: { width, height, channels: 4 },
+      })
+        .extract({ left: t.x, top: t.y, width: t.w, height: t.h })
+        .raw()
+        .toBuffer();
+
+      return {
+        ...t,
+        base64: tileRaw.toString('base64'), // raw RGBA
+      };
+    })
+  );
+
+  return { width, height, tiles };
+}
+
+// Express route
+app.post('/render', async (req, res) => {
+  try {
+    let { latex, fontsize = 48 } = req.body;
+
+    if (typeof latex !== 'string' || latex.length === 0) {
+      return res.status(400).json({ error: 'latex must be a non-empty string' });
+    }
+    if (typeof fontsize !== 'number' || fontsize <= 0 || !isFinite(fontsize)) {
+      return res.status(400).json({ error: 'fontsize must be a positive number' });
     }
 
-    let TileHeights = [];
-    for (let y = 0; y < TotalHeight; y += MaxTileSize) {
-        TileHeights.push(Math.min(MaxTileSize, TotalHeight - y));
-    }
-
-    let TilesBase64 = [];
-    for (let y = 0; y < TotalHeight; y += MaxTileSize) {
-        for (let x = 0; x < TotalWidth; x += MaxTileSize) {
-            const TileWidth = Math.min(MaxTileSize, TotalWidth - x);
-            const TileHeight = Math.min(MaxTileSize, TotalHeight - y);
-
-            const TileBuffer = await Sharp(RawBuffer, {
-                raw: { width: TotalWidth, height: TotalHeight, channels: BytesPerPixel }
-            })
-            .extract({ left: x, top: y, width: TileWidth, height: TileHeight })
-            .png({ quality: 100 })
-            .toBuffer();
-            
-            TilesBase64.push(TileBuffer.toString('base64'));
-        }
-    }
-
-    return {
-        tiles: TilesBase64,
-        width: TotalWidth,
-        height: TotalHeight,
-        tileWidths: TileWidths,
-        tileHeights: TileHeights,
-        bytesPerPixel: BytesPerPixel,
-        channelOrder: ChannelOrder,
-        pixelDensity: PixelDensity
-    };
-};
-
-const RenderWithRetries = async (Latex, FontSize, PixelDensity) => {
-    let LastError;
-    for (let Attempt = 1; Attempt <= RenderAttempts; Attempt++) {
-        try {
-            const Result = await RenderLatex(Latex, FontSize, PixelDensity);
-            return Result;
-        } catch (Error) {
-            LastError = Error;
-            console.warn(`Render Attempt ${Attempt} failed: ${Error.message}`);
-            if (Attempt < RenderAttempts) {
-                await new Promise(Resolve => setTimeout(Resolve, BackoffDelay * Attempt));
-            }
-        }
-    }
-    throw LastError;
-};
-
-const PrewarmCommon = async (Formulas) => {
-    console.log(`Prewarming ${Formulas.length} formulas...`);
-    for (const Formula of Formulas) {
-        const { latex, fontSize, pixelDensity = 2 } = Formula;
-        const Key = GetRenderKey(latex, fontSize, pixelDensity);
-        if (RenderCache.Get(Key)) {
-            continue;
-        }
-        try {
-            const Result = await RenderWithRetries(latex, fontSize, pixelDensity);
-            RenderCache.Set(Key, Result);
-            console.log(`Prewarmed: ${latex.substring(0, 20)}...`);
-        } catch (Error) {
-            console.error(`Failed to prewarm: ${latex}: ${Error.message}`);
-        }
-    }
-    console.log("Prewarming complete.");
-};
-
-App.post('/renderFast', (Request, Response) => {
-    const { latex, fontSize = 64, pixelDensity = 2, requestId = null } = Request.body;
-    const Key = GetRenderKey(latex, fontSize, pixelDensity);
-    const CachedResult = RenderCache.Get(Key);
-
-    if (CachedResult) {
-        Response.json({ 
-            hit: true, 
-            result: { ...CachedResult, success: true, requestId }
-        });
-    } else {
-        Response.json({ hit: false, requestId });
-    }
-});
-
-App.post('/render', async (Request, Response) => {
-    const { latex, fontSize = 64, pixelDensity = 2, requestId = null } = Request.body;
-    
-    if (!latex || !MathJaxInstance) {
-        return Response.status(400).json({ 
-            success: false, 
-            requestId, 
-            error: "Invalid request or MathJax not ready." 
-        });
-    }
-
-    const Key = GetRenderKey(latex, fontSize, pixelDensity);
-    const CachedResult = RenderCache.Get(Key);
-    if (CachedResult) {
-        return Response.json({ ...CachedResult, success: true, requestId });
-    }
-
-    try {
-        const RenderResult = await RenderWithRetries(latex, fontSize, pixelDensity);
-        RenderCache.Set(Key, RenderResult);
-        Response.json({ ...RenderResult, success: true, requestId });
-    } catch (Error) {
-        Response.status(500).json({ 
-            success: false, 
-            requestId, 
-            error: `Render failed after ${RenderAttempts} attempts: ${Error.message}` 
-        });
-    }
-});
-
-App.get('/health', (Request, Response) => {
-    Response.status(200).json({ 
-        status: "OK", 
-        mathJaxReady: !!MathJaxInstance,
-        cacheStats: RenderCache.Stats()
+    // Convert LaTeX to SVG
+    // em: MathJax default is 16px; scale fonts linearly with requested fontsize
+    const node = mj.convert(latex, {
+      display: true,
+      em: fontsize / 16,
+      ex: fontsize / 8,
     });
+
+    let svgString = adaptor.outerHTML(node);
+
+    // Ensure white text using currentColor → white at root
+    // MathJax SVGs generally use currentColor for fill/stroke; we set the svg style color to white.
+    // If user provided explicit color, they can override; default is white here.
+    svgString = svgString.replace(
+      /<svg\b([^>]*)>/i,
+      (m, attrs) => `<svg${attrs} style="color:#ffffff">`
+    );
+
+    const { width, height, tiles } = await renderLatexToRawTiles(svgString, 260);
+
+    res.json({
+      width,
+      height,
+      fontsize,
+      tiles, // [{x,y,w,h,base64}] base64 is raw RGBA
+    });
+  } catch (err) {
+    // Avoid leaking internals; return concise error
+    res.status(500).json({ error: String(err && err.message || err) });
+  }
 });
 
-const Port = process.env.PORT || 3000;
-App.listen(Port, () => {
-    console.log(`Server listening on port ${Port}`);
-    PrewarmCommon([
-        { latex: "E = mc^2", fontSize: 64, pixelDensity: 2 },
-        { latex: "\\frac{a}{b}", fontSize: 64, pixelDensity: 2 }
-    ]);
+// UptimeRobot / health
+app.get('/', (req, res) => res.type('text').send('OK'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`LaTeX renderer listening on ${PORT}`);
 });
