@@ -1,12 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { mathjax } = require('mathjax-full/js/mathjax');
-const { TeX } = require('mathjax-full/js/input/tex');
-const { SVG } = require('mathjax-full/js/output/svg');
-const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor');
-const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html');
-const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages');
+const { mathjax } = require('mathjax-full/js/mathjax.js');
+const { TeX } = require('mathjax-full/js/input/tex.js');
+const { SVG } = require('mathjax-full/js/output/svg.js');
+const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor.js');
+const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html.js');
+const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages.js');
 const sharp = require('sharp');
 
 const app = express();
@@ -97,7 +97,7 @@ async function ConvertSvgToPng(SvgString, Width, Height, Attempt = 1) {
     } catch (Error) {
         if (Attempt < 3) {
             await new Promise(Resolve => setTimeout(Resolve, Attempt * 200));
-            const LowerDensity = Math.max(1, Density - (Attempt - 1) * 0.5);
+            const LowerDensity = Math.max(1, 2 - (Attempt - 1) * 0.5);
             return ConvertSvgToPng(SvgString, Width, Height, Attempt + 1);
         }
         throw Error;
@@ -186,3 +186,8 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
     console.log(`LaTeX render service running on port ${PORT}`);
 });
+
+setInterval(() => {
+    fetch(`http://localhost:${PORT}/health`)
+        .catch(() => {});
+}, 14 * 60 * 1000);
