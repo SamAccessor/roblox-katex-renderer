@@ -20,7 +20,46 @@ RegisterHTMLHandler(adaptor);
 
 const tex = new TeX({ packages: AllPackages });
 const svg = new SVG({ fontCache: "none" });
-const mathDocument = mathjax.document("", { InputJax: tex, OutputJax: svg });
+const mj = mathjax.document("", { InputJax: tex, OutputJax: svg });
+
+function sanitizeSVG(svgText) {
+  // Extract the <svg> root if wrapped in <mjx-container> or other nodes
+  const match = svgText.match(/<svg[^>]*>[\s\S]*<\/svg>/);
+  if (match) return match[0].trim();
+  return `<svg xmlns="http://www.w3.org/2000/svg"><text x="0" y="16" fill="white">Invalid SVG</text></svg>`;
+}
+
+// Retry wrapper
+async function safeRenderMath(latex, fontSize, retries = 5) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const node = mj.convert(latex, {
+        display: true,
+        em: fontSize / 16,
+        ex: fontSize / 8,
+        containerWidth: 80 * 16,
+      });
+
+      let svgOutput = adaptor.outerHTML(node).trim();
+      svgOutput = sanitizeSVG(svgOutput);
+
+      // Validate that we now have proper <svg>
+      if (!svgOutput.includes("<svg") || !svgOutput.includes("</svg>")) {
+        throw new Error("MathJax output missing <svg> root");
+      }
+
+      const pngBuffer = await sharp(Buffer.from(svgOutput))
+        .png({ compressionLevel: 9 })
+        .toBuffer();
+
+      return pngBuffer.toString("base64");
+    } catch (err) {
+      console.warn(`[Attempt ${attempt}] Render error: ${err.message}`);
+      if (attempt === retries) throw err;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+}
 
 // -------------------- Render Route --------------------
 app.post("/render", async (req, res) => {
@@ -32,41 +71,9 @@ app.post("/render", async (req, res) => {
 
     console.log(`[RenderRaw] Rendering: ${latex}`);
 
-    // --- Convert LaTeX → SVG ---
-    const node = mathDocument.convert(latex, {
-      display: true,
-      em: fontSize / 16,
-      ex: fontSize / 8,
-      containerWidth: 80 * 16
-    });
+    const base64 = await safeRenderMath(latex, fontSize);
 
-    let svgOutput = adaptor.outerHTML(node).trim();
-
-    // Ensure valid <svg> root
-    if (!svgOutput.startsWith("<svg")) {
-      console.error("❌ MathJax did not produce a valid SVG root, repairing...");
-      svgOutput = `<svg xmlns="http://www.w3.org/2000/svg">${svgOutput}</svg>`;
-    }
-
-    // --- Validate ---
-    if (!svgOutput.includes("<svg") || !svgOutput.includes("</svg>")) {
-      throw new Error("SVG output invalid — missing <svg> tags");
-    }
-
-    // --- Convert SVG → PNG (transparent, high-res) ---
-    const pngBuffer = await sharp(Buffer.from(svgOutput))
-      .png({ compressionLevel: 9, adaptiveFiltering: true })
-      .toBuffer();
-
-    const base64 = pngBuffer.toString("base64");
-
-    res.json({
-      success: true,
-      base64,
-      width: 1024,
-      height: 1024,
-    });
-
+    res.json({ success: true, base64 });
     console.log("✅ Render successful");
   } catch (err) {
     console.error("❌ Render failed:", err.message);
