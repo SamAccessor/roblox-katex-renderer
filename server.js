@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -12,81 +11,93 @@ import { AllPackages } from "mathjax-full/js/input/tex/AllPackages.js";
 
 const App = express();
 App.use(cors());
-App.use(bodyParser.json({ limit: "10mb" }));
+App.use(bodyParser.json({ limit: "20mb" }));
 
 const Adaptor = liteAdaptor();
 RegisterHTMLHandler(Adaptor);
-
 const Tex = new TeX({ packages: AllPackages });
 const SvgOutput = new SVG({ fontCache: "none" });
 const MjDocument = mathjax.document("", { InputJax: Tex, OutputJax: SvgOutput });
 
-function extractSvgCandidate(htmlString) {
-  if (!htmlString) return null;
-  const svgMatch = htmlString.match(/<svg[\s\S]*?<\/svg>/i);
-  if (svgMatch) return svgMatch[0].trim();
-  // attempt to unescape common entities and try again
-  const unescaped = htmlString.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
-  const svgMatch2 = unescaped.match(/<svg[\s\S]*?<\/svg>/i);
-  if (svgMatch2) return svgMatch2[0].trim();
+class LruCache {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.map = new Map();
+  }
+  get(key) {
+    const v = this.map.get(key);
+    if (!v) return null;
+    this.map.delete(key);
+    this.map.set(key, v);
+    return v.value;
+  }
+  set(key, value) {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, { value, ts: Date.now() });
+    while (this.map.size > this.capacity) this.map.delete(this.map.keys().next().value);
+  }
+}
+
+const Cache = new LruCache(800);
+
+function extractSvg(html) {
+  if (!html) return null;
+  const m = html.match(/<svg[\s\S]*?<\/svg>/i);
+  if (m) return m[0].trim();
+  const u = html.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const m2 = u.match(/<svg[\s\S]*?<\/svg>/i);
+  if (m2) return m2[0].trim();
   return null;
 }
 
-function ensureXmlns(svgText) {
-  if (!svgText) return svgText;
-  if (/xmlns=/.test(svgText)) return svgText;
-  // inject xmlns into opening svg tag
-  return svgText.replace(/<svg([\s>])/i, '<svg xmlns="http://www.w3.org/2000/svg"$1');
+function ensureXmlns(svg) {
+  if (!svg) return svg;
+  if (/\sxmlns=/.test(svg)) return svg;
+  return svg.replace(/<svg([^>]*)>/i, '<svg xmlns="http://www.w3.org/2000/svg"$1>');
 }
 
-function wrapFallback(content) {
-  const safe = String(content)
-    .replace(/<\/?script[\s\S]*?>/gi, "") // remove scripts if any
-    .replace(/<svg[^>]*>/i, "") // remove accidental nested svg open
-    .replace(/<\/svg>/i, "");
-  return `<svg xmlns="http://www.w3.org/2000/svg"><g fill="#ffffff">${safe}</g></svg>`;
+async function svgToRgbaTiles(svg, pixelDensity = 2) {
+  const png = await sharp(Buffer.from(svg, "utf8"), { limitInputPixels: false }).png().toBuffer();
+  const meta = await sharp(png).metadata();
+  const width = meta.width;
+  const height = meta.height;
+  if (!width || !height) throw new Error("invalid raster dimensions");
+  const tiles = [];
+  const tileWidths = [];
+  const tileHeights = [];
+  for (let top = 0; top < height; top += 1024) {
+    const rowHeight = Math.min(1024, height - top);
+    for (let left = 0; left < width; left += 1024) {
+      const tileWidth = Math.min(1024, width - left);
+      const raw = await sharp(png).extract({ left, top, width: tileWidth, height: rowHeight }).raw().toBuffer();
+      tiles.push(raw.toString("base64"));
+      tileWidths.push(tileWidth);
+      tileHeights.push(rowHeight);
+    }
+  }
+  return { tiles, tileWidths, tileHeights, width, height, bytesPerPixel: 4, channelOrder: "RGBA", pixelDensity };
 }
 
-async function renderLatexToBase64(latex, fontSize = 64, retries = 3) {
+async function renderLatex(latex, fontSize = 64, pixelDensity = 2, retries = 3) {
+  const key = `${latex}|${fontSize}|${pixelDensity}`;
+  const cached = Cache.get(key);
+  if (cached) return { success: true, cached: true, ...cached };
   let lastErr = null;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const node = MjDocument.convert(latex, {
-        display: true,
-        em: fontSize / 16,
-        ex: fontSize / 8,
-        containerWidth: 80 * 16
-      });
-
+      const node = MjDocument.convert(latex, { display: true, em: fontSize / 16, ex: fontSize / 8, containerWidth: 80 * 16 });
       let raw = Adaptor.outerHTML(node);
-      if (typeof raw !== "string") raw = String(raw || "");
-
-      const svgCandidate = extractSvgCandidate(raw);
-      let finalSvg = svgCandidate;
-      if (!finalSvg) finalSvg = wrapFallback(raw);
-      finalSvg = ensureXmlns(finalSvg);
-
-      // final sanity check
-      if (!finalSvg.includes("<svg") || !finalSvg.includes("</svg>")) {
-        throw new Error("Unable to produce valid SVG");
-      }
-
-      // optional small trimming of whitespace/newlines
-      finalSvg = finalSvg.trim();
-
-      // produce PNG from SVG
-      const pngBuffer = await sharp(Buffer.from(finalSvg, "utf8"), { limitInputPixels: false })
-        .png({ compressionLevel: 9, adaptiveFiltering: true })
-        .toBuffer();
-
-      return { success: true, base64: pngBuffer.toString("base64") };
+      let svg = extractSvg(raw);
+      if (!svg) svg = `<svg xmlns="http://www.w3.org/2000/svg"><g fill="#FFFFFF">${String(raw)}</g></svg>`;
+      svg = ensureXmlns(svg);
+      if (!svg.includes("<svg")) throw new Error("no svg");
+      const tilesResult = await svgToRgbaTiles(svg, pixelDensity);
+      Cache.set(key, tilesResult);
+      return { success: true, cached: false, ...tilesResult };
     } catch (err) {
       lastErr = err;
-      if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 150 * attempt));
-        continue;
-      }
-      return { success: false, error: String(err && err.message ? err.message : err) };
+      if (attempt < retries) await new Promise(r => setTimeout(r, 120 * attempt));
+      else return { success: false, error: String(err && err.message ? err.message : err) };
     }
   }
   return { success: false, error: String(lastErr) };
@@ -94,27 +105,58 @@ async function renderLatexToBase64(latex, fontSize = 64, retries = 3) {
 
 App.get("/health", (_, res) => res.json({ ok: true }));
 
+App.post("/renderFast", async (req, res) => {
+  try {
+    const { latex, fontSize = 64, pixelDensity = 2 } = req.body || {};
+    const key = `${latex}|${fontSize}|${pixelDensity}`;
+    const cached = Cache.get(key);
+    if (!cached) return res.json({ hit: false });
+    return res.json({ hit: true, result: cached });
+  } catch (err) {
+    return res.status(500).json({ hit: false, error: String(err && err.message ? err.message : err) });
+  }
+});
+
+App.post("/prewarm", async (req, res) => {
+  try {
+    const jobs = Array.isArray(req.body) ? req.body : [];
+    const results = [];
+    for (const j of jobs) {
+      const latex = String(j.latex || "");
+      const fontSize = Number.isFinite(j.fontSize) ? j.fontSize : 64;
+      const pixelDensity = Number.isFinite(j.pixelDensity) ? j.pixelDensity : 2;
+      if (!latex) continue;
+      const r = await renderLatex(latex, fontSize, pixelDensity, 3);
+      results.push({ latex, ok: r.success });
+    }
+    return res.json({ ok: true, results });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
+  }
+});
+
 App.post("/render", async (req, res) => {
   try {
-    const latex = typeof req.body?.latex === "string" ? req.body.latex : "";
-    if (!latex) return res.status(400).json({ success: false, error: "Missing LaTeX" });
-
-    const truncated = (latex.length > 200 ? latex.slice(0, 200) + "..." : latex);
-    console.log(`[RenderRaw] Rendering (truncated): ${truncated}`);
-
-    const result = await renderLatexToBase64(latex, Number(req.body.fontSize) || 64, 5);
-
-    if (!result.success) {
-      console.error("Render failed:", result.error);
-      return res.status(500).json({ success: false, error: result.error });
-    }
-
-    return res.json({ success: true, base64: result.base64 });
+    const { latex, fontSize = 64, pixelDensity = 2, requestId = "" } = req.body || {};
+    if (!latex) return res.status(400).json({ success: false, requestId, error: "latex required" });
+    const result = await renderLatex(latex, fontSize, pixelDensity, 4);
+    if (!result.success) return res.status(500).json({ success: false, requestId, error: result.error || "render error" });
+    return res.json({
+      success: true,
+      requestId,
+      tiles: result.tiles,
+      tileWidths: result.tileWidths,
+      tileHeights: result.tileHeights,
+      width: result.width,
+      height: result.height,
+      bytesPerPixel: result.bytesPerPixel,
+      channelOrder: result.channelOrder,
+      pixelDensity: result.pixelDensity
+    });
   } catch (err) {
-    console.error("Unexpected render error:", err && err.stack ? err.stack : err);
-    return res.status(500).json({ success: false, error: String(err && err.message ? err.message : err) });
+    return res.status(500).json({ success: false, requestId: "", error: String(err && err.message ? err.message : err) });
   }
 });
 
 const PORT = Number(process.env.PORT || 10000);
-App.listen(PORT, () => console.log(`✅ MathJax Render Server running on port ${PORT}`));
+App.listen(PORT);
