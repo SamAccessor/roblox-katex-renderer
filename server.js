@@ -1,126 +1,132 @@
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const { mathjax } = require('mathjax-full/js/mathjax.js');
-const { TeX } = require('mathjax-full/js/input/tex.js');
-const { SVG } = require('mathjax-full/js/output/svg.js');
-const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor.js');
-const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html.js');
-const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages.js');
-const sharp = require('sharp');
+// server.js
 
-const App = express();
-App.use(cors());
-App.use(bodyParser.json({ limit: '10mb' }));
+const express = require("express")
+const cors = require("cors")
+const bodyParser = require("body-parser")
+const sharp = require("sharp")
+const {mathjax} = require("mathjax-full/js/mathjax.js")
+const {TeX} = require("mathjax-full/js/input/tex.js")
+const {SVG} = require("mathjax-full/js/output/svg.js")
+const {liteAdaptor} = require("mathjax-full/js/adaptors/liteAdaptor.js")
+const {RegisterHTMLHandler} = require("mathjax-full/js/handlers/html.js")
+const app = express()
+app.disable("x-powered-by")
+app.use(cors())
+app.use(bodyParser.json({limit: "1mb"}))
+const Port = process.env.PORT || 3000
+const MaxTileSize = 1024
+const PixelDensity = 2
+const BytesPerPixel = 4
+const ChannelOrder = "RGBA"
+const RenderAttempts = 3
 
-const MAX_TILE = 1024;
-const MAX_RETRIES = 3;
-const DEFAULT_PIXEL_DENSITY = 2;
-
-let MathJaxAdaptor = null;
-let MathJaxDocument = null;
-
-async function InitMathJax() {
-  if (MathJaxDocument) return;
-  MathJaxAdaptor = liteAdaptor();
-  RegisterHTMLHandler(MathJaxAdaptor);
-  const m = await mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) });
-  MathJaxDocument = m;
+function RenderLatexToSVG(Latex, FontSize) {
+	const Adaptor = liteAdaptor()
+	RegisterHTMLHandler(Adaptor)
+	const Html = mathjax.document("", {
+		InputJax: new TeX({}),
+		OutputJax: new SVG({fontCache: "none"})
+	})
+	const Node = Html.convert(Latex, {
+		display: true,
+		em: FontSize,
+		ex: FontSize / 2,
+	})
+	let Svg = Adaptor.outerHTML(Node)
+	Svg = Svg.replace(/fill="black"/g, 'fill="white"')
+	Svg = Svg.replace(/<svg /, `<svg style="background:transparent;" `)
+	return Svg
 }
 
-function ParseViewBox(svg) {
-  const vb = svg.match(/viewBox=["']([^"']+)["']/);
-  if (vb) {
-    const parts = vb[1].trim().split(/[\s,]+/).map(Number);
-    if (parts.length === 4 && parts.every(n => Number.isFinite(n))) return { width: parts[2], height: parts[3] };
-  }
-  const w = svg.match(/<svg[^>]*\bwidth=["']?([\d.]+)(?:px)?["']?/);
-  const h = svg.match(/<svg[^>]*\bheight=["']?([\d.]+)(?:px)?["']?/);
-  if (w && h) {
-    const W = Number(w[1]);
-    const H = Number(h[1]);
-    if (Number.isFinite(W) && Number.isFinite(H)) return { width: W, height: H };
-  }
-  return null;
+async function RenderSVGToPNGBuffer(Svg, Density) {
+	const SvgBuffer = Buffer.from(Svg)
+	const Image = sharp(SvgBuffer, {density: Density * 72, limitInputPixels: false})
+	const Metadata = await Image.metadata()
+	const Width = Math.ceil(Metadata.width * Density)
+	const Height = Math.ceil(Metadata.height * Density)
+	const PngBuffer = await Image
+		.resize(Width, Height)
+		.png({compressionLevel: 9, adaptiveFiltering: false, force: true})
+		.toBuffer()
+	return {PngBuffer, Width, Height}
 }
 
-function EnsureSvgDimensions(svg, pixelDensity, fallbackFontPx) {
-  const vb = ParseViewBox(svg);
-  if (vb) {
-    const W = Math.max(1, Math.ceil(vb.width * pixelDensity));
-    const H = Math.max(1, Math.ceil(vb.height * pixelDensity));
-    const replaced = svg.replace(/<svg([^>]*)>/, (m, attrs) => {
-      const cleaned = attrs.replace(/\b(width|height)=["'][^"']*["']/g, '');
-      return `<svg${cleaned} width="${W}" height="${H}">`;
-    });
-    return { svg: replaced, width: W, height: H };
-  }
-  const Fw = Math.max(256, Math.ceil((fallbackFontPx || 64) * 10 * (pixelDensity || 1)));
-  const Fh = Math.max(32, Math.ceil((fallbackFontPx || 64) * 2 * (pixelDensity || 1)));
-  const wrapped = `<svg xmlns="http://www.w3.org/2000/svg" width="${Fw}" height="${Fh}" viewBox="0 0 ${Fw} ${Fh}">${svg}</svg>`;
-  return { svg: wrapped, width: Fw, height: Fh };
+function SplitBufferToTiles(Buffer, Width, Height, TileWidth, TileHeight) {
+	const Tiles = []
+	const TileWidths = []
+	const TileHeights = []
+	for (let y = 0; y < Height; y += TileHeight) {
+		const CurrentTileHeight = Math.min(TileHeight, Height - y)
+		TileHeights.push(CurrentTileHeight)
+		for (let x = 0; x < Width; x += TileWidth) {
+			const CurrentTileWidth = Math.min(TileWidth, Width - x)
+			TileWidths.push(CurrentTileWidth)
+			const Tile = Buffer.slice(
+				(y * Width + x) * BytesPerPixel,
+				((y + CurrentTileHeight) * Width + (x + CurrentTileWidth)) * BytesPerPixel
+			)
+			Tiles.push(Tile)
+		}
+	}
+	return {Tiles, TileWidths, TileHeights}
 }
 
-async function LatexToSvg(latex) {
-  await InitMathJax();
-  const node = MathJaxDocument.convert(latex, { display: true });
-  const svg = MathJaxAdaptor.outerHTML(node);
-  return svg;
+async function RenderLatexImage(Latex, FontSize) {
+	for (let Attempt = 1; Attempt <= RenderAttempts; Attempt++) {
+		try {
+			const Svg = RenderLatexToSVG(Latex, FontSize)
+			const {PngBuffer, Width, Height} = await RenderSVGToPNGBuffer(Svg, PixelDensity)
+			const Image = sharp(PngBuffer, {limitInputPixels: false})
+			const RawBuffer = await Image.raw().toBuffer()
+			const TileWidth = MaxTileSize
+			const TileHeight = MaxTileSize
+			const Tiles = []
+			const TileWidths = []
+			const TileHeights = []
+			for (let y = 0; y < Height; y += TileHeight) {
+				const CurrentTileHeight = Math.min(TileHeight, Height - y)
+				TileHeights.push(CurrentTileHeight)
+				for (let x = 0; x < Width; x += TileWidth) {
+					const CurrentTileWidth = Math.min(TileWidth, Width - x)
+					TileWidths.push(CurrentTileWidth)
+					const TileBuffer = Buffer.alloc(CurrentTileWidth * CurrentTileHeight * BytesPerPixel)
+					for (let ty = 0; ty < CurrentTileHeight; ty++) {
+						const SrcStart = ((y + ty) * Width + x) * BytesPerPixel
+						const SrcEnd = SrcStart + CurrentTileWidth * BytesPerPixel
+						const DstStart = ty * CurrentTileWidth * BytesPerPixel
+						RawBuffer.copy(TileBuffer, DstStart, SrcStart, SrcEnd)
+					}
+					Tiles.push(TileBuffer.toString("base64"))
+				}
+			}
+			return {
+				success: true,
+				tiles: Tiles,
+				width: Width,
+				height: Height,
+				tileWidths: TileWidths,
+				tileHeights: TileHeights,
+				bytesPerPixel: BytesPerPixel,
+				channelOrder: ChannelOrder,
+				pixelDensity: PixelDensity
+			}
+		} catch (Error) {
+			if (Attempt === RenderAttempts) {
+				return {success: false, error: Error.message}
+			}
+		}
+	}
+	return {success: false, error: "Unknown error"}
 }
 
-async function SvgToTiles(svgString, fontPx = 64, pixelDensity = DEFAULT_PIXEL_DENSITY) {
-  const ensured = EnsureSvgDimensions(svgString, pixelDensity, fontPx);
-  const finalSvg = ensured.svg;
-  const pngBuffer = await sharp(Buffer.from(finalSvg, 'utf8'), { limitInputPixels: false }).png({ quality: 100 }).toBuffer();
-  const meta = await sharp(pngBuffer).metadata();
-  const width = meta.width;
-  const height = meta.height;
-  if (!width || !height) throw new Error('Invalid raster dimensions');
-  const tiles = [];
-  const tileWidths = [];
-  for (let left = 0; left < width; left += MAX_TILE) {
-    const tileWidth = Math.min(MAX_TILE, width - left);
-    const raw = await sharp(pngBuffer).extract({ left, top: 0, width: tileWidth, height }).raw().toBuffer();
-    tiles.push(raw.toString('base64'));
-    tileWidths.push(tileWidth);
-  }
-  return { tiles, width, height, tileWidths, bytesPerPixel: 4, channelOrder: 'RGBA', pixelDensity };
-}
+app.post("/render", async (req, res) => {
+	const {latex, fontSize} = req.body
+	if (typeof latex !== "string" || typeof fontSize !== "number") {
+		res.json({success: false, error: "Invalid input"})
+		return
+	}
+	const Result = await RenderLatexImage(latex, fontSize)
+	res.json(Result)
+})
 
-async function RenderWithRetries(latex, fontSize, pixelDensity) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const svg = await LatexToSvg(latex);
-      const result = await SvgToTiles(svg, fontSize, pixelDensity);
-      return { success: true, tiles: result.tiles, width: result.width, height: result.height, tileWidths: result.tileWidths, tileHeights: [result.height], bytesPerPixel: result.bytesPerPixel, channelOrder: result.channelOrder, pixelDensity: result.pixelDensity };
-    } catch (e) {
-      lastErr = e;
-      if (attempt < MAX_RETRIES) {
-        if (attempt === 1) pixelDensity = Math.max(1, Math.floor((pixelDensity || DEFAULT_PIXEL_DENSITY) / 2));
-        await new Promise(r => setTimeout(r, 200 * attempt));
-        continue;
-      }
-      return { success: false, error: String(e && e.message ? e.message : e) };
-    }
-  }
-  return { success: false, error: String(lastErr) };
-}
-
-App.post('/render', async (req, res) => {
-  try {
-    const body = req.body || {};
-    const latex = typeof body.latex === 'string' ? body.latex : '';
-    const fontSize = Number.isFinite(body.fontSize) ? body.fontSize : 64;
-    const pixelDensity = Number.isFinite(body.pixelDensity) ? body.pixelDensity : DEFAULT_PIXEL_DENSITY;
-    if (!latex) return res.status(400).json({ success: false, error: 'latex required' });
-    const result = await RenderWithRetries(latex, fontSize, pixelDensity);
-    if (!result.success) return res.status(500).json(result);
-    return res.json(result);
-  } catch (err) {
-    return res.status(500).json({ success: false, error: String(err && err.message ? err.message : err) });
-  }
-});
-
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-App.listen(PORT);
+app.listen(Port)
