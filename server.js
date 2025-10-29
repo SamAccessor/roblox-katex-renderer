@@ -1,8 +1,8 @@
-const Express = require('express');
-const Cors = require('cors');
-const BodyParser = require('body-parser');
-const MathJax = require('mathjax-full');
-const Sharp = require('sharp');
+import Express from 'express';
+import Cors from 'cors';
+import BodyParser from 'body-parser';
+import MathJax from 'mathjax-full';
+import Sharp from 'sharp';
 
 const App = Express();
 App.use(Cors());
