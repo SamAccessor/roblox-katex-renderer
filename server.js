@@ -7,39 +7,43 @@ const sharp = require('sharp');
 
 const MAX_TILE = 1024;
 
+// Optional: inline KaTeX CSS for robustness (shortened here); you can inline the full CSS string.
+const KATEX_CSS_LINK = 'https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css';
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
-function htmlTemplate(latex, fontPx) {
+function HtmlTemplate(latex, fontPx) {
   const mathHTML = katex.renderToString(latex, {
     throwOnError: false,
     displayMode: true
   });
+
   return `
 <!doctype html>
 <html>
   <head>
     <meta charset="utf-8"/>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css">
+    <link rel="stylesheet" href="${KATEX_CSS_LINK}">
     <style>
       html, body { margin:0; padding:0; background:transparent; }
-      #math {
+      #Math {
         display:inline-block;
         color:white;             /* white text */
         background:transparent;  /* transparent background */
         font-size:${fontPx}px;
       }
-      body, #math { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+      body, #Math { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
     </style>
   </head>
   <body>
-    <div id="math">${mathHTML}</div>
+    <div id="Math">${mathHTML}</div>
   </body>
 </html>`;
 }
 
-async function renderLatex(latex, fontPx = 64, pixelDensity = 2) {
+async function RenderLatexToRgbaTiles(latex, fontPx = 64, pixelDensity = 2) {
   const browser = await puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
@@ -50,30 +54,48 @@ async function renderLatex(latex, fontPx = 64, pixelDensity = 2) {
     deviceScaleFactor: pixelDensity
   });
 
-  await page.setContent(htmlTemplate(latex, fontPx), { waitUntil: 'networkidle0' });
+  await page.setContent(HtmlTemplate(latex, fontPx), { waitUntil: 'networkidle0' });
 
-  const el = await page.$('#math');
+  const el = await page.$('#Math');
   if (!el) {
     await browser.close();
-    throw new Error('KaTeX element not found');
+    throw new Error('Math element not found');
   }
 
-  const png = await el.screenshot({ type: 'png', omitBackground: true });
+  const pngBuffer = await el.screenshot({ type: 'png', omitBackground: true });
   await browser.close();
 
-  const { width, height } = await sharp(png).metadata();
+  // Get full dimensions at device scale
+  const { width, height } = await sharp(pngBuffer).metadata();
+  if (!width || !height) {
+    throw new Error('Unable to read rendered image dimensions');
+  }
 
-  // Slice horizontally to ≤1024px per tile
+  // Slice horizontally into MAX_TILE tiles and convert each tile to raw RGBA
   const base64Chunks = [];
   const tileWidths = [];
   for (let left = 0; left < width; left += MAX_TILE) {
-    const w = Math.min(MAX_TILE, width - left);
-    const tileBuf = await sharp(png).extract({ left, top: 0, width: w, height }).png().toBuffer();
-    base64Chunks.push(tileBuf.toString('base64'));
-    tileWidths.push(w);
+    const tileWidth = Math.min(MAX_TILE, width - left);
+    const tile = await sharp(pngBuffer)
+      .extract({ left, top: 0, width: tileWidth, height })
+      .raw()
+      .toBuffer(); // raw uncompressed RGBA, 4 bytes/pixel
+
+    base64Chunks.push(tile.toString('base64'));
+    tileWidths.push(tileWidth);
   }
 
-  return { base64Chunks, tileWidths, width, height };
+  // Explicit metadata to ensure client scales precisely
+  return {
+    base64Chunks,               // raw RGBA tiles, left→right
+    tileWidths,                 // each tile’s width in pixels
+    width,                      // full image width
+    height,                     // full image height (also equationHeightPx)
+    pixelDensity,               // deviceScaleFactor
+    equationHeightPx: height,   // alias used by client scaling
+    bytesPerPixel: 4,           // RGBA8
+    channelOrder: 'RGBA'        // byte order in each pixel
+  };
 }
 
 app.post('/render', async (req, res) => {
@@ -85,7 +107,7 @@ app.post('/render', async (req, res) => {
     const fontPx = Number.isFinite(fontSize) ? fontSize : 64;
     const density = Number.isFinite(pixelDensity) ? pixelDensity : 2;
 
-    const result = await renderLatex(latex, fontPx, density);
+    const result = await RenderLatexToRgbaTiles(latex, fontPx, density);
     res.json(result);
   } catch (err) {
     console.error('Render error:', err);
