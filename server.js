@@ -84,7 +84,7 @@ async function renderLatex(latex, fontSizeRequested) {
 }
 
 // --- Health Check Endpoint --- //
-app.get("/health", async (req, res) => {
+App.get("/health", async (req, res) => {
   try {
     const uptimeSeconds = process.uptime();
     const memory = process.memoryUsage();
