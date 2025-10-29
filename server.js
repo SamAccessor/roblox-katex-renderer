@@ -22,23 +22,23 @@ const Tex = new TeX({ packages: AllPackages });
 const SvgOutput = new SVG({ fontCache: "none" });
 const MjDocument = mathjax.document("", { InputJax: Tex, OutputJax: SvgOutput });
 
-function ExtractSvg(html) {
+function extractSvg(html) {
   if (!html) return null;
   const m = html.match(/<svg[\s\S]*?<\/svg>/i);
   if (m) return m[0].trim();
-  const u = html.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
-  const m2 = u.match(/<svg[\s\S]*?<\/svg>/i);
+  const unescaped = html.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const m2 = unescaped.match(/<svg[\s\S]*?<\/svg>/i);
   if (m2) return m2[0].trim();
   return null;
 }
 
-function EnsureXmlns(svg) {
+function ensureXmlnsOnce(svg) {
   if (!svg) return svg;
   if (/\sxmlns=/.test(svg)) return svg;
-  return svg.replace(/<svg([^>]*)>/i, '<svg xmlns="http://www.w3.org/2000/svg"$1>');
+  return svg.replace(/^<svg\b/, '<svg xmlns="http://www.w3.org/2000/svg"');
 }
 
-async function SvgToTiles(svg) {
+async function svgToTiles(svg) {
   const png = await sharp(Buffer.from(svg, "utf8"), { limitInputPixels: false }).png().toBuffer();
   const meta = await sharp(png).metadata();
   const width = meta.width;
@@ -60,26 +60,24 @@ async function SvgToTiles(svg) {
   return { tiles, tileWidths, tileHeights, width, height, bytesPerPixel: 4, channelOrder: "RGBA" };
 }
 
-async function RenderLatex(latex, fontSizeRequested) {
+async function renderLatex(latex, fontSizeRequested) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
-      const fontPx = Math.max(1, Math.round(fontSizeRequested * PixelDensity));
+      const minFontPx = 6;
+      const fontPx = Math.max(minFontPx, Math.round(fontSizeRequested * PixelDensity));
       const node = MjDocument.convert(latex, { display: true });
       let raw = Adaptor.outerHTML(node);
-      let svg = ExtractSvg(raw);
+      let svg = extractSvg(raw);
       if (!svg) svg = `<svg xmlns="http://www.w3.org/2000/svg"><g>${String(raw)}</g></svg>`;
-      svg = EnsureXmlns(svg);
-      const Style = '<style>svg *{fill:#ffffff !important;color:#ffffff !important;stroke:none !important}svg{background:transparent}</style>';
-      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}>${Style}`);
-      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs} style="background:transparent">`);
-      svg = svg.replace(/<g([^>]*)>/i, (m, attrs) => '<g fill="#FFFFFF">');
-      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}><style>svg{font-size:${fontPx}px}</style>`);
-      const tilesResult = await SvgToTiles(svg);
+      svg = ensureXmlnsOnce(svg);
+      const styleTag = `<style>svg{font-size:${fontPx}px}svg *{fill:#ffffff !important;color:#ffffff !important;stroke:none !important}svg{background:transparent}</style>`;
+      if (!svg.includes("svg *{fill:#ffffff")) svg = svg.replace(/^<svg\b([^>]*)>/i, (m, attrs) => `<svg${attrs}>${styleTag}`);
+      const tilesResult = await svgToTiles(svg);
       return { success: true, fontSizeRequested, fontPx, pixelDensity: PixelDensity, ...tilesResult };
     } catch (e) {
       lastErr = e;
-      if (attempt < 5) await new Promise(r => setTimeout(r, 100 * attempt));
+      if (attempt < 5) await new Promise(r => setTimeout(r, 120 * attempt));
     }
   }
   return { success: false, error: String(lastErr && lastErr.message ? lastErr.message : lastErr) };
@@ -94,7 +92,7 @@ App.post("/render", async (req, res) => {
     const requestId = typeof req.body?.requestId === "string" ? req.body.requestId : "";
     if (!latex) return res.status(400).json({ success: false, requestId, error: "latex required" });
     console.log("[Server] render request", requestId, "fontSizeRequested=", fontSizeRequested, "len=", latex.length);
-    const result = await RenderLatex(latex, fontSizeRequested);
+    const result = await renderLatex(latex, fontSizeRequested);
     if (!result.success) {
       console.error("[Server] render failed", result.error);
       return res.status(500).json({ success: false, requestId, error: result.error });
