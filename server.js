@@ -1,126 +1,126 @@
-const express = require("express")
-const cors = require("cors")
-const bodyParser = require("body-parser")
-const sharp = require("sharp")
-const mathjax = require("mathjax")
-const App = express()
-App.disable("x-powered-by")
-App.use(cors())
-App.use(bodyParser.json({limit: "1mb"}))
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const sharp = require('sharp');
+const { mathjax } = require('mathjax-full/js/mathjax.js');
+const { TeX } = require('mathjax-full/js/input/tex.js');
+const { SVG } = require('mathjax-full/js/output/svg.js');
+const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor.js');
+const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html.js');
+const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages.js');
 
-const Port = process.env.PORT || 3000
-const MaxTileSize = 1024
-const BytesPerPixel = 4
-const ChannelOrder = "RGBA"
-const RenderAttempts = 3
-const PixelDensityPrimary = 2
-const PixelDensityFallback = 1
+const App = express();
+App.use(cors());
+App.use(bodyParser.json({ limit: '10mb' }));
 
-let MathJaxInstance = null
+const MAX_TILE = 1024;
+const MAX_RETRIES = 3;
+const PIXEL_DENSITY = 2;
 
-async function InitializeMathJax() {
-	if (!MathJaxInstance) {
-		MathJaxInstance = await mathjax.init({
-			loader: {load: ["input/tex", "output/svg"]},
-			tex: {packages: "all"},
-			svg: {fontCache: "none"}
-		})
-	}
+let Adaptor = null;
+let Document = null;
+
+async function InitMathJax() {
+  if (Document) return;
+  Adaptor = liteAdaptor();
+  RegisterHTMLHandler(Adaptor);
+  Document = mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) });
 }
 
-function BuildWhiteTransparentSvg(S) {
-	let R = S.replace(/fill="black"/g, 'fill="white"')
-	if (!/style="/.test(R)) {
-		R = R.replace(/<svg /, '<svg style="background:transparent;" ')
-	} else {
-		R = R.replace(/style="([^"]*)"/, function(M, P1) {
-			const K = P1.includes("background") ? P1 : P1 + ";background:transparent;"
-			return 'style="' + K + '"'
-		})
-	}
-	return R
+function ParseViewBox(svg) {
+  const vb = svg.match(/viewBox=["']([^"']+)["']/);
+  if (vb) {
+    const parts = vb[1].trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts.every(n => Number.isFinite(n))) return { width: parts[2], height: parts[3] };
+  }
+  const w = svg.match(/<svg[^>]*\bwidth=["']?([\d.]+)(?:px)?["']?/);
+  const h = svg.match(/<svg[^>]*\bheight=["']?([\d.]+)(?:px)?["']?/);
+  if (w && h) {
+    const W = Number(w[1]);
+    const H = Number(h[1]);
+    if (Number.isFinite(W) && Number.isFinite(H)) return { width: W, height: H };
+  }
+  return null;
 }
 
-async function TexToSvg(Latex, FontSize) {
-	const M = MathJaxInstance
-	const Node = M.svgDocument().convert(Latex, {display: true, em: FontSize, ex: FontSize / 2})
-	const Svg = M.startup.adaptor.outerHTML(Node)
-	return BuildWhiteTransparentSvg(Svg)
+function EnsureSvgDimensions(svg, pixelDensity, fallbackFontPx) {
+  const vb = ParseViewBox(svg);
+  if (vb) {
+    const W = Math.max(1, Math.ceil(vb.width * pixelDensity));
+    const H = Math.max(1, Math.ceil(vb.height * pixelDensity));
+    const replaced = svg.replace(/<svg([^>]*)>/, (m, attrs) => {
+      const cleaned = attrs.replace(/\b(width|height)=["'][^"']*["']/g, '');
+      return `<svg${cleaned} width="${W}" height="${H}">`;
+    });
+    const styled = replaced.replace(/<svg/, '<svg style="background:transparent">').replace(/<g /, '<g fill="#FFFFFF" ');
+    return { svg: styled, width: W, height: H };
+  }
+  const Fw = Math.max(256, Math.ceil((fallbackFontPx || 64) * 10 * (pixelDensity || 1)));
+  const Fh = Math.max(32, Math.ceil((fallbackFontPx || 64) * 2 * (pixelDensity || 1)));
+  const wrapped = `<svg xmlns="http://www.w3.org/2000/svg" width="${Fw}" height="${Fh}" viewBox="0 0 ${Fw} ${Fh}"><g fill="#FFFFFF">${svg}</g></svg>`;
+  return { svg: wrapped, width: Fw, height: Fh };
 }
 
-async function SvgToRawRgba(Svg, Density) {
-	const SvgBuffer = Buffer.from(Svg)
-	const Image = sharp(SvgBuffer, {density: Density * 72, limitInputPixels: false})
-	const Meta = await Image.metadata()
-	const Width = Math.ceil((Meta.width || 0) * Density)
-	const Height = Math.ceil((Meta.height || 0) * Density)
-	const Raw = await Image.resize(Width, Height).raw().toBuffer()
-	return {Raw, Width, Height}
+async function LatexToSvg(latex) {
+  await InitMathJax();
+  const node = Document.convert(latex, { display: true });
+  const svg = Adaptor.outerHTML(node);
+  return svg;
 }
 
-function TileRawRgba(Raw, Width, Height, TileWidth, TileHeight) {
-	const Tiles = []
-	const TileWidths = []
-	const TileHeights = []
-	for (let y = 0; y < Height; y += TileHeight) {
-		const Th = Math.min(TileHeight, Height - y)
-		for (let x = 0; x < Width; x += TileWidth) {
-			const Tw = Math.min(TileWidth, Width - x)
-			const TileBuffer = Buffer.alloc(Tw * Th * BytesPerPixel)
-			for (let row = 0; row < Th; row++) {
-				const SrcStart = ((y + row) * Width + x) * BytesPerPixel
-				const SrcEnd = SrcStart + Tw * BytesPerPixel
-				const DstStart = row * Tw * BytesPerPixel
-				Raw.copy(TileBuffer, DstStart, SrcStart, SrcEnd)
-			}
-			Tiles.push(TileBuffer.toString("base64"))
-			TileWidths.push(Tw)
-			TileHeights.push(Th)
-		}
-	}
-	return {Tiles, TileWidths, TileHeights}
+async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = PIXEL_DENSITY) {
+  const ensured = EnsureSvgDimensions(svgString, pixelDensity, fontPx);
+  const finalSvg = ensured.svg;
+  const pngBuffer = await sharp(Buffer.from(finalSvg, 'utf8'), { limitInputPixels: false }).png({ quality: 100 }).toBuffer();
+  const meta = await sharp(pngBuffer).metadata();
+  const width = meta.width;
+  const height = meta.height;
+  if (!width || !height) throw new Error('Invalid raster dimensions');
+  const base64Chunks = [];
+  const tileWidths = [];
+  for (let left = 0; left < width; left += MAX_TILE) {
+    const tileWidth = Math.min(MAX_TILE, width - left);
+    const tileRaw = await sharp(pngBuffer).extract({ left, top: 0, width: tileWidth, height }).raw().toBuffer();
+    base64Chunks.push(tileRaw.toString('base64'));
+    tileWidths.push(tileWidth);
+  }
+  return { base64Chunks, tileWidths, width, height, bytesPerPixel: 4, channelOrder: 'RGBA', pixelDensity };
 }
 
-async function RenderLatex(Latex, FontSize) {
-	let LastError = null
-	for (let Attempt = 1; Attempt <= RenderAttempts; Attempt++) {
-		try {
-			const Density = Attempt === 1 ? PixelDensityPrimary : PixelDensityFallback
-			const Svg = await TexToSvg(Latex, FontSize)
-			const {Raw, Width, Height} = await SvgToRawRgba(Svg, Density)
-			const {Tiles, TileWidths, TileHeights} = TileRawRgba(Raw, Width, Height, MaxTileSize, MaxTileSize)
-			return {
-				success: true,
-				tiles: Tiles,
-				width: Width,
-				height: Height,
-				tileWidths: TileWidths,
-				tileHeights: TileHeights,
-				bytesPerPixel: BytesPerPixel,
-				channelOrder: ChannelOrder,
-				pixelDensity: Density
-			}
-		} catch (E) {
-			LastError = E && E.message ? E.message : "RenderFailed"
-		}
-	}
-	return {success: false, error: LastError || "RenderFailed"}
+async function RenderWithRetries(latex, fontSize) {
+  let lastErr = null;
+  let density = PIXEL_DENSITY;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const svg = await LatexToSvg(latex);
+      const result = await SvgToRgbaTiles(svg, fontSize || 64, density);
+      return { success: true, tiles: result.base64Chunks, width: result.width, height: result.height, tileWidths: result.tileWidths, tileHeights: [result.height], bytesPerPixel: result.bytesPerPixel, channelOrder: result.channelOrder, pixelDensity: result.pixelDensity };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < MAX_RETRIES) {
+        density = Math.max(1, Math.floor(density / 2));
+        await new Promise(r => setTimeout(r, 150 * attempt));
+        continue;
+      }
+      return { success: false, error: String(e && e.message ? e.message : e) };
+    }
+  }
+  return { success: false, error: String(lastErr) };
 }
 
-App.post("/render", async (req, res) => {
-	try {
-		const Latex = req.body && typeof req.body.latex === "string" ? req.body.latex : null
-		const FontSize = req.body && typeof req.body.fontSize === "number" ? req.body.fontSize : null
-		if (!Latex || !FontSize) {
-			res.json({success: false, error: "InvalidInput"})
-			return
-		}
-		await InitializeMathJax()
-		const Result = await RenderLatex(Latex, FontSize)
-		res.json(Result)
-	} catch (E) {
-		res.json({success: false, error: "ServerError"})
-	}
-})
+App.post('/render', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const latex = typeof body.latex === 'string' ? body.latex : '';
+    const fontSize = Number.isFinite(body.fontSize) ? body.fontSize : 64;
+    if (!latex) return res.status(400).json({ success: false, error: 'latex required' });
+    const result = await RenderWithRetries(latex, fontSize);
+    if (!result.success) return res.status(500).json(result);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ success: false, error: String(err && err.message ? err.message : err) });
+  }
+});
 
-App.listen(Port)
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+App.listen(PORT);
