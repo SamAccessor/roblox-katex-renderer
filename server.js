@@ -1,78 +1,110 @@
-// server.js -- MathJax + Sharp renderer
-// - Converts LaTeX -> SVG via MathJax (server-side)
-// - Uses sharp to rasterize SVG -> PNG/raw RGBA
-// - Slices left->right into tiles <= 1024px and returns base64 raw RGBA tiles
-
+// server.js  (MathJax + Sharp renderer; robust SVG dimension handling)
 const express = require('express');
 const cors = require('cors');
-const sharp = require('sharp');
-const MathJax = require('mathjax'); // mathjax package
 const bodyParser = require('body-parser');
+const sharp = require('sharp');
+const MathJax = require('mathjax');
 
 const MAX_TILE = 1024;
 const App = express();
 App.use(cors());
 App.use(bodyParser.json({ limit: '10mb' }));
 
-// Initialize MathJax once
-let MathJaxInstancePromise = null;
+let MathJaxInitPromise = null;
 function InitMathJax() {
-  if (!MathJaxInstancePromise) {
-    // mathjax.init API returns a Promise that resolves to a MathJax object with converters
-    MathJaxInstancePromise = MathJax.init({
+  if (!MathJaxInitPromise) {
+    MathJaxInitPromise = MathJax.init({
       loader: { load: ['input/tex', 'output/svg'] },
-      tex: { packages: ['base', 'ams'] },
+      tex: { packages: ['base', 'ams'] }
     });
   }
-  return MathJaxInstancePromise;
+  return MathJaxInitPromise;
 }
 
-// Wrap latex into an SVG string using MathJax
-async function LatexToSvg(latex, fontPx = 64) {
-  const MathJaxObj = await InitMathJax();
-  // tex2svg returns an element-like object or serialized string depending on API;
-  // MathJax v4 exported API exposes a `tex2svg` method that returns an SVG node with outerHTML
-  // We'll coerce to string
-  const svgNode = MathJaxObj.tex2svg(latex, { display: true });
-  // Some builds return a node; take outerHTML if present, else assume it's a string.
+function ParseViewBox(svgString) {
+  // returns { minX, minY, width, height } or null
+  const vbMatch = svgString.match(/viewBox=["']([^"']+)["']/);
+  if (vbMatch) {
+    const parts = vbMatch[1].trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts.every(n => !Number.isNaN(n))) {
+      return { minX: parts[0], minY: parts[1], width: parts[2], height: parts[3] };
+    }
+  }
+  // try width/height attributes (e.g., width="123px" or width="123")
+  const wMatch = svgString.match(/<svg[^>]*\bwidth=["']?([\d.]+)(?:px)?["']?/);
+  const hMatch = svgString.match(/<svg[^>]*\bheight=["']?([\d.]+)(?:px)?["']?/);
+  if (wMatch && hMatch) {
+    const w = Number(wMatch[1]);
+    const h = Number(hMatch[1]);
+    if (!Number.isNaN(w) && !Number.isNaN(h)) {
+      return { minX: 0, minY: 0, width: w, height: h };
+    }
+  }
+  return null;
+}
+
+function EnsureSvgHasDimensions(svgString, pixelDensity, fallbackFontPx) {
+  // try to get viewBox or width/height from the svg; if found, add width/height attributes scaled by pixelDensity
+  const vb = ParseViewBox(svgString);
+  if (vb) {
+    const W = Math.max(1, Math.ceil(vb.width * pixelDensity));
+    const H = Math.max(1, Math.ceil(vb.height * pixelDensity));
+    // replace opening <svg ...> to include width & height attributes
+    const replaced = svgString.replace(/<svg([^>]*)>/, function(_, attrs) {
+      // remove existing width/height if present
+      const cleanedAttrs = attrs.replace(/\b(width|height)=["'][^"']*["']/g, '');
+      // ensure viewBox present (keep original)
+      return `<svg${cleanedAttrs} width="${W}" height="${H}">`;
+    });
+    return { svg: replaced, pixelWidth: W, pixelHeight: H };
+  }
+
+  // No viewBox: try to rasterize by wrapping content in a fixed canvas using fallbackFontPx
+  // We attempt a conservative fallback: treat fallbackFontPx * 10 as width, fallbackFontPx * 2 as height
+  const fallbackWidth = Math.max(256, Math.ceil((fallbackFontPx || 64) * 10 * (pixelDensity || 1)));
+  const fallbackHeight = Math.max(32, Math.ceil((fallbackFontPx || 64) * 2 * (pixelDensity || 1)));
+  // Wrap original svg inside an outer svg with explicit width/height and a viewBox if possible
+  const wrapped =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${fallbackWidth}" height="${fallbackHeight}" viewBox="0 0 ${fallbackWidth} ${fallbackHeight}">` +
+    svgString +
+    `</svg>`;
+  return { svg: wrapped, pixelWidth: fallbackWidth, pixelHeight: fallbackHeight, usedFallback: true };
+}
+
+async function LatexToSvg(latex) {
+  const mj = await InitMathJax();
+  // tex2svg returns an SVG element or string; convert to string
+  // mathjax.tex2svg returns a DOM node with outerHTML in many builds
+  const svgNode = mj.tex2svg(latex, { display: true });
   const svgString = (typeof svgNode === 'string') ? svgNode : (svgNode.outerHTML || svgNode.toString());
-  // Wrap the svg (MathJax output may not set font-size on top-level). Add width:auto and style white fill + transparent background.
-  // We'll insert a CSS to ensure fill white and preserve transparency.
-  const wrappedSvg = `
-    <svg xmlns="http://www.w3.org/2000/svg">
-      <foreignObject x="0" y="0" width="100%" height="100%">
-        <div xmlns="http://www.w3.org/1999/xhtml">
-          <style>
-            :root { background: transparent; color: #FFFFFF; }
-            svg { fill: #FFFFFF; }
-          </style>
-          ${svgString}
-        </div>
-      </foreignObject>
-    </svg>
-  `;
-  return wrappedSvg;
+  // ensure that the svgString has xmlns on svg tags (MathJax usually includes it)
+  if (!/<svg[^>]*xmlns=/.test(svgString)) {
+    // add xmlns to top-level svg (best-effort)
+    return svgString.replace(/<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  return svgString;
 }
 
-// Rasterize SVG at desired pixelDensity & compute dimensions
 async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = 2) {
-  // Determine an explicit raster width/height by letting sharp render at an initial scale
-  // We'll rasterize the svg to a PNG buffer at a reasonably large width, then use sharp.metadata() to get exact pixels.
-  // Because MathJax output has intrinsic sizing, sharp can compute the raster size from the SVG's viewBox.
-  // Use density param by scaling via the `density` option when input is SVG (SVG density is DPI-like)
-  // We'll pass the svg buffer to sharp and let it rasterize at appropriate dimensions.
-  // To ensure crispness, we can multiply by pixelDensity.
-  const svgBuffer = Buffer.from(svgString, 'utf8');
+  // ensure svg has explicit width & height (sharp requires them or a viewBox)
+  const ensured = EnsureSvgHasDimensions(svgString, pixelDensity, fontPx);
+  const finalSvg = ensured.svg;
+  // Rasterize via sharp; we rely on explicit width/height in the svg
+  // Use sharp with input as Buffer and output raw RGBA
+  // We'll render to PNG first, then extract raw tiles (so we can use .raw().toBuffer on the extracted region)
+  let pngBuffer;
+  try {
+    pngBuffer = await sharp(Buffer.from(finalSvg, 'utf8')).png({ quality: 100 }).toBuffer();
+  } catch (err) {
+    // include extra debug info
+    err.message = `SVG rasterization failed: ${err.message}. SVG sample head: ${finalSvg.slice(0, 512)}`;
+    throw err;
+  }
 
-  // First rasterize to PNG buffer at scale (sharp has options: svg input supports density but exact sizing depends on SVG)
-  // To guarantee high-res, we can render at a large width by setting a big width param, but we don't know desired width
-  // Simpler: render to PNG with no explicit width, then use metadata to get pixel dimensions.
-  const pngBuffer = await sharp(svgBuffer, { density: 72 * pixelDensity }).png({ quality: 100 }).toBuffer();
   const meta = await sharp(pngBuffer).metadata();
   const width = meta.width;
   const height = meta.height;
-
-  if (!width || !height) throw new Error('Could not rasterize SVG to a valid image (no width/height)');
+  if (!width || !height) throw new Error('SVG rasterized to invalid width/height');
 
   const base64Chunks = [];
   const tileWidths = [];
@@ -82,7 +114,7 @@ async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = 2) {
     const tileRaw = await sharp(pngBuffer)
       .extract({ left, top: 0, width: tileWidth, height })
       .raw()
-      .toBuffer(); // raw RGBA, 4 bytes per pixel
+      .toBuffer(); // raw RGBA
     base64Chunks.push(tileRaw.toString('base64'));
     tileWidths.push(tileWidth);
   }
@@ -108,13 +140,13 @@ App.post('/render', async (req, res) => {
     const fontPx = Number.isFinite(fontSize) ? fontSize : 64;
     const density = Number.isFinite(pixelDensity) ? pixelDensity : 2;
 
-    // Convert latex -> SVG -> rasterized tiles
-    const svg = await LatexToSvg(latex, fontPx);
+    const svg = await LatexToSvg(latex);
     const result = await SvgToRgbaTiles(svg, fontPx, density);
-    res.json(result);
+    return res.json(result);
   } catch (err) {
     console.error('Render error:', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: String(err && err.message ? err.message : err) });
+    // Always return JSON with error string
+    return res.status(500).json({ error: String(err && err.message ? err.message : err) });
   }
 });
 
