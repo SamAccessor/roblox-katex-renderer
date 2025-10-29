@@ -11,20 +11,20 @@ const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages.js');
 
 const App = express();
 App.use(cors());
-App.use(bodyParser.json({ limit: '10mb' }));
+App.use(bodyParser.json({ limit: '20mb' }));
 
 const MAX_TILE = 1024;
 const MAX_RETRIES = 3;
-const PIXEL_DENSITY = 2;
+const DEFAULT_PIXEL_DENSITY = 2;
 
 let Adaptor = null;
-let Document = null;
+let Doc = null;
 
 async function InitMathJax() {
-  if (Document) return;
+  if (Doc) return;
   Adaptor = liteAdaptor();
   RegisterHTMLHandler(Adaptor);
-  Document = mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) });
+  Doc = mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) });
 }
 
 function ParseViewBox(svg) {
@@ -48,40 +48,40 @@ function EnsureSvgDimensions(svg, pixelDensity, fallbackFontPx) {
   if (vb) {
     const W = Math.max(1, Math.ceil(vb.width * pixelDensity));
     const H = Math.max(1, Math.ceil(vb.height * pixelDensity));
-    const replaced = svg.replace(/<svg([^>]*)>/, (m, attrs) => {
+    const replaced = svg.replace(/<svg([^>]*)>/, function(m, attrs) {
       const cleaned = attrs.replace(/\b(width|height)=["'][^"']*["']/g, '');
-      return `<svg${cleaned} width="${W}" height="${H}">`;
+      return '<svg' + cleaned + ' width="' + W + '" height="' + H + '">';
     });
-    const styled = replaced.replace(/<svg/, '<svg style="background:transparent">').replace(/<g /, '<g fill="#FFFFFF" ');
+    const styled = replaced.replace(/<svg/, '<svg style="background:transparent"').replace(/<g /, '<g fill="#FFFFFF" ');
     return { svg: styled, width: W, height: H };
   }
   const Fw = Math.max(256, Math.ceil((fallbackFontPx || 64) * 10 * (pixelDensity || 1)));
   const Fh = Math.max(32, Math.ceil((fallbackFontPx || 64) * 2 * (pixelDensity || 1)));
-  const wrapped = `<svg xmlns="http://www.w3.org/2000/svg" width="${Fw}" height="${Fh}" viewBox="0 0 ${Fw} ${Fh}"><g fill="#FFFFFF">${svg}</g></svg>`;
+  const wrapped = '<svg xmlns="http://www.w3.org/2000/svg" width="' + Fw + '" height="' + Fh + '" viewBox="0 0 ' + Fw + ' ' + Fh + '"><g fill="#FFFFFF">' + svg + '</g></svg>';
   return { svg: wrapped, width: Fw, height: Fh };
 }
 
 async function LatexToSvg(latex) {
   await InitMathJax();
-  const node = Document.convert(latex, { display: true });
+  const node = Doc.convert(latex, { display: true });
   const svg = Adaptor.outerHTML(node);
   return svg;
 }
 
-async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = PIXEL_DENSITY) {
+async function SvgToRgbaTiles(svgString, fontPx, pixelDensity) {
   const ensured = EnsureSvgDimensions(svgString, pixelDensity, fontPx);
   const finalSvg = ensured.svg;
   const pngBuffer = await sharp(Buffer.from(finalSvg, 'utf8'), { limitInputPixels: false }).png({ quality: 100 }).toBuffer();
   const meta = await sharp(pngBuffer).metadata();
   const width = meta.width;
   const height = meta.height;
-  if (!width || !height) throw new Error('Invalid raster dimensions');
+  if (!width || !height) throw new Error('invalid raster dimensions');
   const base64Chunks = [];
   const tileWidths = [];
   for (let left = 0; left < width; left += MAX_TILE) {
     const tileWidth = Math.min(MAX_TILE, width - left);
-    const tileRaw = await sharp(pngBuffer).extract({ left, top: 0, width: tileWidth, height }).raw().toBuffer();
-    base64Chunks.push(tileRaw.toString('base64'));
+    const raw = await sharp(pngBuffer).extract({ left, top: 0, width: tileWidth, height }).raw().toBuffer();
+    base64Chunks.push(raw.toString('base64'));
     tileWidths.push(tileWidth);
   }
   return { base64Chunks, tileWidths, width, height, bytesPerPixel: 4, channelOrder: 'RGBA', pixelDensity };
@@ -89,7 +89,7 @@ async function SvgToRgbaTiles(svgString, fontPx = 64, pixelDensity = PIXEL_DENSI
 
 async function RenderWithRetries(latex, fontSize) {
   let lastErr = null;
-  let density = PIXEL_DENSITY;
+  let density = DEFAULT_PIXEL_DENSITY;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const svg = await LatexToSvg(latex);
