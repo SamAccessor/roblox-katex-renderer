@@ -35,7 +35,7 @@ function ExtractSvg(html) {
 function EnsureXmlns(svg) {
   if (!svg) return svg;
   if (/\sxmlns=/.test(svg)) return svg;
-  return svg.replace(/<svg([^>]*)>/i, '<svg xmlns="http://www.w3.org/2000/svg"$1');
+  return svg.replace(/<svg([^>]*)>/i, '<svg xmlns="http://www.w3.org/2000/svg"$1>');
 }
 
 async function SvgToTiles(svg) {
@@ -57,32 +57,29 @@ async function SvgToTiles(svg) {
       tileHeights.push(rowH);
     }
   }
-  return { tiles, tileWidths, tileHeights, width, height, bytesPerPixel: 4, channelOrder: "RGBA", pixelDensity: PixelDensity };
+  return { tiles, tileWidths, tileHeights, width, height, bytesPerPixel: 4, channelOrder: "RGBA" };
 }
 
-async function RenderLatex(latex, fontSize) {
+async function RenderLatex(latex, fontSizeRequested) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
-      const node = MjDocument.convert(latex, { display: true, em: fontSize / 16, ex: fontSize / 8, containerWidth: 80 * 16 });
+      const fontPx = Math.max(1, Math.round(fontSizeRequested * PixelDensity));
+      const node = MjDocument.convert(latex, { display: true });
       let raw = Adaptor.outerHTML(node);
       let svg = ExtractSvg(raw);
       if (!svg) svg = `<svg xmlns="http://www.w3.org/2000/svg"><g>${String(raw)}</g></svg>`;
       svg = EnsureXmlns(svg);
-      if (!svg.includes("<style")) {
-        const Style = '<style>svg *{fill:#ffffff !important;color:#ffffff !important;stroke:none !important}svg{background:transparent}</style>';
-        svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}>${Style}`);
-      } else {
-        svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}><style>svg *{fill:#ffffff !important;color:#ffffff !important;stroke:none !important}svg{background:transparent}</style>`);
-      }
-      if (!/fill="#FFFFFF"/i.test(svg)) {
-        svg = svg.replace(/<g([^>]*)>/i, (m, attrs) => '<g fill="#FFFFFF">');
-      }
+      const Style = '<style>svg *{fill:#ffffff !important;color:#ffffff !important;stroke:none !important}svg{background:transparent}</style>';
+      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}>${Style}`);
+      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs} style="background:transparent">`);
+      svg = svg.replace(/<g([^>]*)>/i, (m, attrs) => '<g fill="#FFFFFF">');
+      svg = svg.replace(/<svg([^>]*)>/i, (m, attrs) => `<svg${attrs}><style>svg{font-size:${fontPx}px}</style>`);
       const tilesResult = await SvgToTiles(svg);
-      return { success: true, fontSizeUsed: fontSize, pixelDensity: PixelDensity, ...tilesResult };
+      return { success: true, fontSizeRequested, fontPx, pixelDensity: PixelDensity, ...tilesResult };
     } catch (e) {
       lastErr = e;
-      if (attempt < 5) await new Promise(r => setTimeout(r, 120 * attempt));
+      if (attempt < 5) await new Promise(r => setTimeout(r, 100 * attempt));
     }
   }
   return { success: false, error: String(lastErr && lastErr.message ? lastErr.message : lastErr) };
@@ -93,11 +90,15 @@ App.get("/health", (_, res) => res.json({ ok: true }));
 App.post("/render", async (req, res) => {
   try {
     const latex = typeof req.body?.latex === "string" ? req.body.latex : "";
-    const fontSize = Number.isFinite(req.body?.fontSize) ? Number(req.body.fontSize) : 64;
+    const fontSizeRequested = Number.isFinite(req.body?.fontSize) ? Number(req.body.fontSize) : 64;
     const requestId = typeof req.body?.requestId === "string" ? req.body.requestId : "";
     if (!latex) return res.status(400).json({ success: false, requestId, error: "latex required" });
-    const result = await RenderLatex(latex, fontSize);
-    if (!result.success) return res.status(500).json({ success: false, requestId, error: result.error });
+    console.log("[Server] render request", requestId, "fontSizeRequested=", fontSizeRequested, "len=", latex.length);
+    const result = await RenderLatex(latex, fontSizeRequested);
+    if (!result.success) {
+      console.error("[Server] render failed", result.error);
+      return res.status(500).json({ success: false, requestId, error: result.error });
+    }
     return res.json({
       success: true,
       requestId,
@@ -109,12 +110,14 @@ App.post("/render", async (req, res) => {
       bytesPerPixel: result.bytesPerPixel,
       channelOrder: result.channelOrder,
       pixelDensity: result.pixelDensity,
-      fontSizeUsed: result.fontSizeUsed
+      fontPx: result.fontPx,
+      fontSizeRequested: result.fontSizeRequested
     });
   } catch (err) {
+    console.error("[Server] unexpected error", err && err.stack ? err.stack : err);
     return res.status(500).json({ success: false, requestId: "", error: String(err && err.message ? err.message : err) });
   }
 });
 
 const Port = Number(process.env.PORT || 10000);
-App.listen(Port);
+App.listen(Port, () => console.log(`[Server] listening on port ${Port}`));
