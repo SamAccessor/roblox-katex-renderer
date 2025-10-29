@@ -1,4 +1,7 @@
 // server.js
+// KaTeX renderer -> PNG -> raw RGBA tiles -> base64 JSON response
+// Uses: express, cors, katex, puppeteer, sharp
+
 const express = require('express');
 const cors = require('cors');
 const katex = require('katex');
@@ -6,20 +9,28 @@ const puppeteer = require('puppeteer');
 const sharp = require('sharp');
 
 const MAX_TILE = 1024;
-
-// Optional: inline KaTeX CSS for robustness (shortened here); you can inline the full CSS string.
 const KATEX_CSS_LINK = 'https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css';
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '5mb' }));
 app.use(cors());
 
+// Simple persistent browser/pool singleton for speed
+let BrowserSingleton = null;
+async function GetBrowser() {
+  if (BrowserSingleton && BrowserSingleton.process() && !BrowserSingleton.process().killed) return BrowserSingleton;
+  BrowserSingleton = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+  return BrowserSingleton;
+}
+
 function HtmlTemplate(latex, fontPx) {
+  // KaTeX renderToString will escape/convert, use displayMode false for inline fallback
   const mathHTML = katex.renderToString(latex, {
     throwOnError: false,
     displayMode: true
   });
 
+  // inline small CSS to ensure white text and transparent background
   return `
 <!doctype html>
 <html>
@@ -30,11 +41,15 @@ function HtmlTemplate(latex, fontPx) {
       html, body { margin:0; padding:0; background:transparent; }
       #Math {
         display:inline-block;
-        color:white;             /* white text */
-        background:transparent;  /* transparent background */
-        font-size:${fontPx}px;
+        color: #FFFFFF;
+        background: transparent;
+        font-size: ${fontPx}px;
+        line-height: 1;
+        padding: 0;
+        margin: 0;
       }
-      body, #Math { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+      /* remove selection artifacts */
+      * { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
     </style>
   </head>
   <body>
@@ -44,57 +59,60 @@ function HtmlTemplate(latex, fontPx) {
 }
 
 async function RenderLatexToRgbaTiles(latex, fontPx = 64, pixelDensity = 2) {
-  const browser = await puppeteer.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
+  const browser = await GetBrowser();
   const page = await browser.newPage();
-  await page.setViewport({
-    width: 1920,
-    height: 1080,
-    deviceScaleFactor: pixelDensity
-  });
 
+  // Set an initial large viewport; we'll get bounding box of #Math
+  await page.setViewport({ width: 4096, height: 2048, deviceScaleFactor: pixelDensity });
   await page.setContent(HtmlTemplate(latex, fontPx), { waitUntil: 'networkidle0' });
 
   const el = await page.$('#Math');
   if (!el) {
-    await browser.close();
-    throw new Error('Math element not found');
+    await page.close();
+    throw new Error('Math element not found after rendering');
   }
 
+  // get bounding box (CSS pixels) and adjust size
+  const bbox = await el.boundingBox();
+  // boundingBox might be null if element invisible
+  if (!bbox) {
+    await page.close();
+    throw new Error('Unable to measure math bounding box');
+  }
+
+  // screenshot of element with transparency (omitBackground)
   const pngBuffer = await el.screenshot({ type: 'png', omitBackground: true });
-  await browser.close();
+  await page.close();
 
-  // Get full dimensions at device scale
-  const { width, height } = await sharp(pngBuffer).metadata();
-  if (!width || !height) {
-    throw new Error('Unable to read rendered image dimensions');
-  }
+  // Use sharp to get metadata (reported in device pixels already because image is rasterized)
+  const meta = await sharp(pngBuffer).metadata();
+  const width = meta.width || Math.ceil(bbox.width * pixelDensity);
+  const height = meta.height || Math.ceil(bbox.height * pixelDensity);
 
-  // Slice horizontally into MAX_TILE tiles and convert each tile to raw RGBA
+  // slice horizontally into tiles (left to right), convert to raw RGBA
   const base64Chunks = [];
   const tileWidths = [];
+
   for (let left = 0; left < width; left += MAX_TILE) {
     const tileWidth = Math.min(MAX_TILE, width - left);
-    const tile = await sharp(pngBuffer)
+    const tileBuffer = await sharp(pngBuffer)
       .extract({ left, top: 0, width: tileWidth, height })
       .raw()
-      .toBuffer(); // raw uncompressed RGBA, 4 bytes/pixel
+      .toBuffer(); // raw RGBA
 
-    base64Chunks.push(tile.toString('base64'));
+    base64Chunks.push(tileBuffer.toString('base64'));
     tileWidths.push(tileWidth);
   }
 
-  // Explicit metadata to ensure client scales precisely
   return {
-    base64Chunks,               // raw RGBA tiles, left→right
-    tileWidths,                 // each tile’s width in pixels
-    width,                      // full image width
-    height,                     // full image height (also equationHeightPx)
-    pixelDensity,               // deviceScaleFactor
-    equationHeightPx: height,   // alias used by client scaling
-    bytesPerPixel: 4,           // RGBA8
-    channelOrder: 'RGBA'        // byte order in each pixel
+    base64Chunks,
+    tileWidths,
+    width,
+    height,
+    pixelDensity,
+    equationHeightPx: height,
+    bytesPerPixel: 4,
+    channelOrder: 'RGBA'
   };
 }
 
